@@ -220,22 +220,46 @@ build_modal_fau_first <- function(all_fau, all_ad, last_norm, city_token, state_
 verify_record_score <- function(fau_vec, ad_vec,
                                 last_norm, target_first, modal_first,
                                 city_token, state_token, org_token) {
+  # ---- [GOLDILOCKS FIX 1] Safe NA handling ----
   fau_same_last <- fau_vec[startsWith(toupper(fau_vec), paste0(toupper(last_norm), ","))]
   fau_score <- 0
   if (length(fau_same_last) > 0) {
     fnames <- vapply(fau_same_last, .fau_first_from, character(1), last_norm = last_norm)
-    fnames <- fnames[nzchar(fnames)]
+    fnames <- fnames[nzchar(fnames) & !is.na(fnames)]  # Safe NA filtering
     if (length(fnames) > 0) {
       tgt <- toupper(target_first %||% "")
       mod <- toupper(modal_first %||% "")
       cand <- unique(fnames)
-      init_ok <- function(a, b) nzchar(a) && nzchar(b) && substr(a,1,1) == substr(b,1,1)
+      
+      # Safe init_ok function with proper NA handling
+      init_ok <- function(a, b) {
+        if (is.na(a) || is.na(b) || length(a) != 1 || length(b) != 1) return(FALSE)
+        nzchar(a) && nzchar(b) && substr(a,1,1) == substr(b,1,1)
+      }
+      
       sims <- numeric(0)
-      if (nzchar(tgt) && any(init_ok(tgt, cand)))
-        sims <- c(sims, max(stringsim(tgt, cand[init_ok(tgt, cand)], method="jw", p=0.1)))
-      if (nzchar(mod) && any(init_ok(mod, cand)))
-        sims <- c(sims, max(stringsim(mod, cand[init_ok(mod, cand)], method="jw", p=0.1)))
-      fau_score <- max(sims, 0, na.rm = TRUE)
+      # Safe similarity calculations with proper NA checks
+      if (nzchar(tgt)) {
+        tgt_matches <- sapply(cand, function(x) init_ok(tgt, x))
+        if (any(tgt_matches, na.rm = TRUE)) {
+          valid_cand <- cand[tgt_matches & !is.na(tgt_matches)]
+          if (length(valid_cand) > 0) {
+            sim_vals <- sapply(valid_cand, function(x) stringsim(tgt, x, method="jw", p=0.1))
+            sims <- c(sims, max(sim_vals, na.rm = TRUE))
+          }
+        }
+      }
+      if (nzchar(mod)) {
+        mod_matches <- sapply(cand, function(x) init_ok(mod, x))
+        if (any(mod_matches, na.rm = TRUE)) {
+          valid_cand <- cand[mod_matches & !is.na(mod_matches)]
+          if (length(valid_cand) > 0) {
+            sim_vals <- sapply(valid_cand, function(x) stringsim(mod, x, method="jw", p=0.1))
+            sims <- c(sims, max(sim_vals, na.rm = TRUE))
+          }
+        }
+      }
+      fau_score <- if (length(sims) > 0) max(sims, 0, na.rm = TRUE) else 0
     }
   }
   aff <- .affil_score(ad_vec, city_token, state_token, org_token)
@@ -250,7 +274,7 @@ verify_record_score <- function(fau_vec, ad_vec,
 
 # Cheap Jaro–Winkler wrapper (returns 0 if inputs are empty)
 .jw <- function(a, b) {
-  if (!nzchar(a) || !nzchar(b)) return(0)
+  if (is.na(a) || is.na(b) || !nzchar(a) || !nzchar(b)) return(0)
   stringdist::stringsim(a, b, method = "jw", p = 0.1)
 }
 
@@ -266,16 +290,19 @@ verify_record_score <- function(fau_vec, ad_vec,
   cand <- fau_vec[startsWith(toupper(fau_vec), paste0(lastU, ","))]
   if (length(cand) == 0) return(list(first=NA_character_, sim=0, matched=FALSE))
   
-  # extract first token after "LAST, "
+  # extract first token after "LAST, " with safe NA handling
   first_tokens <- vapply(cand, .fau_first_from, character(1), last_norm=last_norm)
   first_tokens <- toupper(first_tokens)
-  first_tokens <- first_tokens[nzchar(first_tokens)]
+  first_tokens <- first_tokens[nzchar(first_tokens) & !is.na(first_tokens)]
   
   if (length(first_tokens) == 0) return(list(first=NA_character_, sim=0, matched=FALSE))
   
-  # keep only same first-initial
-  same_init <- substr(first_tokens, 1, 1) == substr(tfirst, 1, 1)
-  first_tokens <- first_tokens[same_init]
+  # keep only same first-initial with safe substr
+  same_init <- sapply(first_tokens, function(x) {
+    if (is.na(x) || !nzchar(x)) return(FALSE)
+    substr(x, 1, 1) == substr(tfirst, 1, 1)
+  })
+  first_tokens <- first_tokens[same_init & !is.na(same_init)]
   if (length(first_tokens) == 0) return(list(first=NA_character_, sim=0, matched=FALSE))
   
   sims <- vapply(first_tokens, function(f) .jw(tfirst, f), numeric(1))
@@ -283,9 +310,10 @@ verify_record_score <- function(fau_vec, ad_vec,
   list(first = first_tokens[i], sim = sims[i], matched = TRUE)
 }
 
+# ---- [GOLDILOCKS FIX 2] Graduated FAU Gate with tier-specific thresholds ----
 # Decide pass/fail for AU-derived records using the FAU Gate
 # For FAU-derived queries, we can be lenient or even skip this gate.
-.fau_gate_pass <- function(fau_vec, last_norm, first_tok, source, risk_last) {
+.fau_gate_pass <- function(fau_vec, last_norm, first_tok, source, risk_last, tier = "AU") {
   # If this record came from a FAU query, it's already precise:
   if (identical(source, "FAU")) {
     # Soft check: ensure there is at least one FAU with same last & same initial
@@ -293,14 +321,22 @@ verify_record_score <- function(fau_vec, ad_vec,
     return(bf$matched && bf$sim >= 0.85)  # FAU threshold: 0.85
   }
   
-  # AU source: require a stricter match
+  # AU source: graduated thresholds based on tier and context
   bf <- .best_fau_match(fau_vec, last_norm, first_tok)
   if (!bf$matched) return(FALSE)
   
   lastU <- toupper(last_norm %||% "")
-  # Stricter JW for very common last names (or if user tagged risk as HIGH)
-  thr <- if (lastU %in% .VERY_COMMON_LAST || identical(risk_last, "HIGH")) 0.95 else 0.93
-  bf$sim >= thr
+  
+  # ---- [GOLDILOCKS CORE] Graduated thresholds ----
+  if (identical(tier, "AU_WITH_AFFIL")) {
+    # Tier 3: More lenient for AU + Affiliation
+    base_thr <- if (lastU %in% .VERY_COMMON_LAST || identical(risk_last, "HIGH")) 0.88 else 0.83
+  } else {
+    # Tier 4: Stricter for AU without affiliation  
+    base_thr <- if (lastU %in% .VERY_COMMON_LAST || identical(risk_last, "HIGH")) 0.95 else 0.93
+  }
+  
+  bf$sim >= base_thr
 }
 # ==== [END PATCH 1] =============================================================
 
@@ -416,7 +452,7 @@ run_decision_tree <- function(row) {
   relaxed_f <- row$name_relaxed_f
   full_fau  <- row$name_full_fau
   
-  do_query <- function(name_term, use_affil, source = "AU") {  # source is "FAU" or "AU"
+  do_query <- function(name_term, use_affil, source = "AU", tier_name = "AU") {  # source is "FAU" or "AU"
     row_start <- proc.time()[["elapsed"]]            # CHANGE 7
     term <- if (use_affil && has_affil) paste(name_term, "AND", affil_blk) else name_term
     term <- gsub('"+','"', term, perl=TRUE)
@@ -467,7 +503,7 @@ run_decision_tree <- function(row) {
       
       # ---- [PATCH 2] FAU Gate (ADD THIS BLOCK) --------------------------------
       # Reject AU-derived candidates unless a FAU in this record looks like our surgeon
-      if (!.fau_gate_pass(fau, last_norm, first_tok, source, risk)) {
+      if (!.fau_gate_pass(fau, last_norm, first_tok, source, risk, tier = tier_name)) {
         if (!is.na(pmid)) pmids_fail <- c(pmids_fail, pmid)
         next
       }
@@ -497,48 +533,63 @@ run_decision_tree <- function(row) {
          pmids_ambiguous  =unique(na.omit(pmids_fail)))
   }
   
-  # ---- [PATCH 3] Re-ordered tiers: FAU-first ----------------------------------
+  # ---- [GOLDILOCKS FIX 3] Improved tier structure with better recovery ----
   
-  # Build FAU "LAST FIRST" term from tokens you already have
-  # NOTE: If you already have row$name_full_fau as something like LAST FIRST[FAU],
-  # you can reuse it; just ensure it's quoted properly.
+  # Build FAU "LAST FIRST" term from tokens you already have with safe handling
   fau_full <- sprintf('"%s %s"[FAU]', last_norm, first_tok)
   
   # Tier 1: FAU + Affiliation + Date window
-  res <- do_query(fau_full, use_affil = TRUE,  source = "FAU")
-  if (res$verified_total > 0) return(c(list(match_tier = 1), res))
+  res <- try(do_query(fau_full, use_affil = TRUE, source = "FAU", tier_name = "FAU"), silent = TRUE)
+  if (!inherits(res, "try-error") && res$verified_total > 0) return(c(list(match_tier = 1), res))
   
   # Tier 2: FAU only + Date window (no affiliation in query)
-  res <- do_query(fau_full, use_affil = FALSE, source = "FAU")
-  if (res$verified_total > 0) return(c(list(match_tier = 2), res))
+  res <- try(do_query(fau_full, use_affil = FALSE, source = "FAU", tier_name = "FAU"), silent = TRUE)
+  if (!inherits(res, "try-error") && res$verified_total > 0) return(c(list(match_tier = 2), res))
   
-  # Tier 3: AU (your existing strict/relaxed terms), but gated by FAU Gate
-  # You already build allowed_set etc. Keep that logic; just pass source="AU".
-  res <- do_query(strict_fm, use_affil = TRUE, source = "AU")
-  if (res$verified_total > 0) return(c(list(match_tier = 3), res))
+  # Tier 3: AU + Affiliation with LENIENT FAU Gate (key recovery tier)
+  res <- try(do_query(strict_fm, use_affil = TRUE, source = "AU", tier_name = "AU_WITH_AFFIL"), silent = TRUE)
+  if (!inherits(res, "try-error") && res$verified_total > 0) return(c(list(match_tier = 3), res))
   
-  res <- do_query(relaxed_f, use_affil = TRUE, source = "AU")
-  if (res$verified_total > 0) return(c(list(match_tier = 3), res))
+  res <- try(do_query(relaxed_f, use_affil = TRUE, source = "AU", tier_name = "AU_WITH_AFFIL"), silent = TRUE)
+  if (!inherits(res, "try-error") && res$verified_total > 0) return(c(list(match_tier = 3), res))
   
-  # Tier 4: Only for STD risk — AU without affiliation but with FAU Gate + small cap
-  if (identical(risk, "STD")) {
-    res <- do_query(strict_fm, use_affil = FALSE, source = "AU")
-    if (res$verified_total > 0 && res$verified_total <= 5) {
-      return(c(list(match_tier = 4), res))
-    } else {
-      return(c(list(match_tier = 4, ambiguous_reason = "TooManyHits_NoAffil"), res))
+  # Tier 3.5: EXPANDED AU + Affiliation recovery for edge cases
+  # Try with even more relaxed matching if we have strong affiliation signals
+  if (has_affil && nchar(affil_blk) > 20) {  # Strong affiliation context
+    # Build a more permissive AU query
+    permissive_au <- sprintf('%s %s[AU]', last_norm, substr(first_tok, 1, 1))
+    res <- try(do_query(permissive_au, use_affil = TRUE, source = "AU", tier_name = "AU_WITH_AFFIL"), silent = TRUE)
+    if (!inherits(res, "try-error") && res$verified_total > 0 && res$verified_total <= 20) {
+      return(c(list(match_tier = 3), res))
     }
   }
   
-  # Fallback: No match
+  # Tier 4: AU without affiliation - STRICT gate and small caps
+  if (identical(risk, "STD")) {
+    res <- try(do_query(strict_fm, use_affil = FALSE, source = "AU", tier_name = "AU_NO_AFFIL"), silent = TRUE)
+    if (!inherits(res, "try-error")) {
+      if (res$verified_total > 0 && res$verified_total <= 5) {
+        return(c(list(match_tier = 4), res))
+      } else if (res$raw_n > 0) {
+        return(c(list(match_tier = 4, ambiguous_reason = "TooManyHits_NoAffil"), res))
+      }
+    }
+  }
+  
+  # Enhanced fallback with better diagnostics
+  fallback_reason <- "Ambiguous_NoAffil"
+  if (inherits(res, "try-error")) {
+    fallback_reason <- paste0("Error_LastTier: ", substr(as.character(res), 1, 100))
+  }
+  
   list(
     match_tier = NA_integer_, term_used = NA_character_, raw_n = 0L,
     verified_total = 0L, verified_first = 0L, verified_last = 0L,
     pmids_verified = character(0), pmids_firstauthor = character(0),
     pmids_lastauthor = character(0),
-    ambiguous_reason = "Ambiguous_NoAffil"
+    ambiguous_reason = fallback_reason
   )
-  # ---- [END PATCH 3] -----------------------------------------------------------
+  # ---- [END GOLDILOCKS FIX 3] --------------------------------------------------
 }
 
 # ---------- MAIN EXECUTION (wrapped; does not auto-run) ----------
@@ -571,8 +622,21 @@ run_phase2_http <- function(in_csv = IN_CSV, out_csv = OUT_CSV) {
     row <- dt[i]
     log_line("Row ", k, "/", length(row_idx), " (NPI=", row$NPI, ")")
     
-    ans <- try(run_decision_tree(row), silent = TRUE)
+    # ---- [GOLDILOCKS FIX 4] Enhanced error handling ----
+    ans <- try({
+      # Validate essential fields before processing
+      if (is.na(row$last_name_norm) || !nzchar(row$last_name_norm)) {
+        stop("Missing last_name_norm")
+      }
+      if (is.na(row$first_name_token) || !nzchar(row$first_name_token)) {
+        stop("Missing first_name_token") 
+      }
+      run_decision_tree(row)
+    }, silent = TRUE)
+    
     if (inherits(ans, "try-error")) {
+      error_msg <- as.character(ans)
+      log_line("ERROR for NPI", row$NPI, ":", substr(error_msg, 1, 150))
       dt[i, `:=`(
         match_tier        = NA_integer_,
         query_used        = NA_character_,
@@ -580,7 +644,7 @@ run_phase2_http <- function(in_csv = IN_CSV, out_csv = OUT_CSV) {
         verified_n_total  = 0L,
         verified_n_first  = 0L,
         verified_n_last   = 0L,
-        ambiguous_reason  = paste0("Error_Query: ", substr(as.character(ans), 1, 200)),
+        ambiguous_reason  = paste0("Error_Query: ", substr(error_msg, 1, 200)),
         pmids_verified    = "",
         pmids_firstauthor = "",
         pmids_lastauthor  = "",
