@@ -225,15 +225,71 @@ try({ library(stringi) }, silent = TRUE)
   if (requireNamespace("stringi", quietly = TRUE)) x <- stringi::stri_trans_general(x, "Latin-ASCII")
   x <- gsub("[’'`]+", " ", x); x <- gsub("[-]+", " ", x); trimws(gsub("\\s+", " ", x))
 }
-build_fau_variants <- function(last_norm, first_tok, middle_tok) {
-  ln <- .normalize_name_for_query(last_norm); fn <- .normalize_name_for_query(first_tok)
-  mi <- .normalize_name_for_query(middle_tok); mi1 <- if (nzchar(mi)) substr(mi,1,1) else ""
-  cand <- c(sprintf('"%s %s"[FAU]', ln, fn), sprintf('"%s, %s"[FAU]', ln, fn))
-  if (nzchar(mi1)) cand <- c(cand,
-                             sprintf('"%s %s %s"[FAU]', ln, fn, mi1), sprintf('"%s, %s %s"[FAU]', ln, fn, mi1))
-  unique(cand)
+# CHANGE V1a — canonicalize last names for comparison (hyphen/space insensitive)
+.canon_last <- function(x) {
+  x <- toupper(x %||% "")
+  x <- gsub("[’'`]+", "", x)
+  x <- gsub("[-\\s]+", "", x)   # remove hyphens and spaces
+  x
 }
 
+# CHANGE V1b — generate particle-aware last-name variants for FAU queries
+.last_variants_from <- function(last_norm) {
+  base <- .normalize_name_for_query(last_norm)
+  if (!nzchar(base)) return(character(0))
+  toks <- strsplit(base, "\\s+", perl = TRUE)[[1]]
+  v <- character(0)
+  
+  # always include: spaced, hyphenated, collapsed
+  spaced   <- paste(toks, collapse = " ")
+  hyphened <- paste(toks, collapse = "-")
+  collapsed<- gsub("\\s+", "", spaced)
+  
+  v <- c(v, spaced, hyphened, collapsed)
+  
+  # handle common particles (prefix stuck or separated)
+  particles <- c("AL","EL","DE","DEL","DI","DA","LA","LE","VAN","VON","MC","MAC")
+  # Case A: multi-token last (e.g., EL NAJJAR) -> add collapsed + hyphen (already), also keep spaced (already)
+  # Case B: single-token but starts with particle stuck to root (e.g., VANOLST, ELNAJJAR, MCDONALD)
+  if (length(toks) == 1L) {
+    one <- toks[1]
+    for (p in particles) {
+      if (startsWith(one, p) && nchar(one) > nchar(p) + 1) {
+        root <- substr(one, nchar(p) + 1, nchar(one))
+        # insert space and hyphen between particle and root
+        v <- c(v, paste(p, root), paste(p, root, sep = "-"))
+      }
+    }
+  }
+  
+  unique(v[nzchar(v)])
+}
+
+# CHANGE V1c — REPLACE your current build_fau_variants with this
+build_fau_variants <- function(last_norm, first_tok, middle_tok) {
+  ln <- .normalize_name_for_query(last_norm)
+  fn <- .normalize_name_for_query(first_tok)
+  mi <- .normalize_name_for_query(middle_tok)
+  mi1 <- if (nzchar(mi)) substr(mi,1,1) else ""
+  
+  lasts <- .last_variants_from(ln)
+  if (!length(lasts)) lasts <- ln
+  
+  out <- character(0)
+  for (L in unique(lasts)) {
+    out <- c(out,
+             sprintf('"%s %s"[FAU]', L, fn),
+             sprintf('"%s, %s"[FAU]', L, fn)
+    )
+    if (nzchar(mi1)) {
+      out <- c(out,
+               sprintf('"%s %s %s"[FAU]', L, fn, mi1),
+               sprintf('"%s, %s %s"[FAU]', L, fn, mi1)
+      )
+    }
+  }
+  unique(out)
+}
 
 normalize_str <- function(x) {
   x <- ifelse(is.na(x), "", x)
@@ -242,60 +298,79 @@ normalize_str <- function(x) {
   x <- gsub("\\s+", " ", x)
   trimws(x)
 }
-
-# CHANGE A1 — replace your existing .fau_first_from with this
+# CHANGE A1 — REPLACE .fau_first_from to compare canonical last names
 .fau_first_from <- function(fau_line, last_norm) {
   if (is.null(fau_line) || length(fau_line) == 0) return(NA_character_)
   x <- toupper(fau_line[1])
   if (!nzchar(x)) return(NA_character_)
-  lastU <- toupper(last_norm %||% "")
-  if (!nzchar(lastU)) return(NA_character_)
-  
-  pat <- paste0("^", lastU, "\\s*,\\s*")
-  if (!grepl(pat, x, perl = TRUE)) return(NA_character_)
-  
-  x <- sub(pat, "", x, perl = TRUE)
-  x <- sub("\\s+[A-Z]$", "", x, perl = TRUE)
-  x <- sub("\\s+[A-Z]$", "", x, perl = TRUE)  # twice = handle 2 initials
-  toks <- strsplit(x, "\\s+", perl = TRUE)[[1]]
-  if (length(toks) == 0) return(NA_character_)
+  parts <- strsplit(x, ",", fixed = TRUE)[[1]]
+  if (!length(parts)) return(NA_character_)
+  last_fau <- trimws(parts[1])
+  if (.canon_last(last_fau) != .canon_last(last_norm %||% "")) return(NA_character_)
+  right <- if (length(parts) >= 2) trimws(parts[2]) else ""
+  # drop trailing single-letter initials (once or twice)
+  right <- sub("\\s+[A-Z]$", "", right, perl = TRUE)
+  right <- sub("\\s+[A-Z]$", "", right, perl = TRUE)
+  toks <- strsplit(right, "\\s+", perl = TRUE)[[1]]
+  if (!length(toks)) return(NA_character_)
   toks[1]
 }
-
-# CHANGE A1.5-fix — NA-safe best FAU match
+# CHANGE A1.5 — REPLACE .best_fau_match to use canonical last filter + NA safety
 .best_fau_match <- function(fau_vec, last_norm, first_tok) {
-  lastU <- toupper(last_norm %||% "")
+  lastU  <- toupper(last_norm %||% "")
   firstU <- toupper(first_tok %||% "")
   if (!length(fau_vec) || !nzchar(lastU) || !nzchar(firstU)) {
     return(list(matched = FALSE, sim = 0))
   }
-  cand <- fau_vec[startsWith(toupper(fau_vec), paste0(lastU, ","))]
+  # keep FAUs whose canonical last equals target canonical last
+  keep <- vapply(strsplit(toupper(fau_vec), ",", fixed = TRUE),
+                 function(p) .canon_last(trimws(p[1])) == .canon_last(lastU),
+                 logical(1))
+  cand <- fau_vec[keep]
   if (!length(cand)) return(list(matched = FALSE, sim = 0))
+  
   fn <- vapply(cand, .fau_first_from, character(1), last_norm = lastU)
   fn <- toupper(fn[!is.na(fn) & fn != ""])
   if (!length(fn)) return(list(matched = FALSE, sim = 0))
-
+  
+  # same initial gate, then JW similarity
   same_init <- substr(fn, 1, 1) == substr(firstU, 1, 1)
   if (!safe_any(same_init)) return(list(matched = FALSE, sim = 0))
-
+  
   sim <- max(stringdist::stringsim(firstU, fn[same_init], method = "jw", p = 0.1), na.rm = TRUE)
-  list(matched = TRUE, sim = ifelse(is.finite(sim), sim, 0))
+  if (!is.finite(sim)) sim <- 0
+  list(matched = TRUE, sim = sim)
 }
-
-# CHANGE B — FAU gate with risk-aware thresholds
-.fau_gate_pass <- function(fau_vec, last_norm, first_tok, source = c("AU","FAU"), risk_last = "STD") {
+# CHANGE B — REPLACE .fau_gate_pass with affiliation-aware thresholds for AU
+.fau_gate_pass <- function(fau_vec, last_norm, first_tok,
+                           source = c("AU","FAU"),
+                           risk_last = "STD",
+                           ad_vec = NULL, city_token = NULL, state_token = NULL, org_token = NULL) {
   source <- match.arg(source)
   lastU  <- toupper(last_norm %||% "")
   firstU <- toupper(first_tok %||% "")
   if (!nzchar(lastU) || !nzchar(firstU)) return(FALSE)
+  
   bf <- .best_fau_match(fau_vec, lastU, firstU)
   if (!bf$matched) return(FALSE)
+  
+  # base thresholds
   if (identical(source, "FAU")) return(bf$sim >= 0.82)
-  very_common <- lastU %in% .VERY_COMMON_LAST || identical(risk_last, "HIGH")
-  thr <- if (very_common) 0.92 else 0.90
-  bf$sim >= thr
+  very_common <- (toupper(lastU) %in% .VERY_COMMON_LAST) || identical(risk_last, "HIGH")
+  base_thr <- if (very_common) 0.92 else 0.90
+  
+  # affiliation-aware easing (only for AU)
+  aff <- 0
+  if (length(ad_vec)) aff <- .affil_score(ad_vec, toupper(city_token %||% ""), toupper(state_token %||% ""), toupper(org_token %||% ""))
+  
+  if (aff >= 1.0) {
+    return(bf$sim >= (base_thr - 0.05))  # strong match: -0.05
+  } else if (aff >= 0.5) {
+    return(bf$sim >= (base_thr - 0.03))  # partial signal: -0.03
+  } else {
+    return(bf$sim >= base_thr)
+  }
 }
-
 
 # CHANGE C1-fix — NA-safe affiliation scoring
 .affil_score <- function(ad_vec, city_token, state_token, org_token) {
@@ -307,11 +382,11 @@ normalize_str <- function(x) {
   re_city  <- .token_regex(city_token)
   re_state <- .token_regex(state_token)
   re_org   <- if (nzchar(org_token) && !is_generic_org(org_token)) .token_regex(org_token) else ""
-
+  
   has_city  <- safe_nzchar(re_city)  && safe_any(grepl(re_city,  ads, perl = TRUE))
   has_state <- safe_nzchar(re_state) && safe_any(grepl(re_state, ads, perl = TRUE))
   has_org   <- safe_nzchar(re_org)   && safe_any(grepl(re_org,   ads, perl = TRUE))
-
+  
   if (has_city && has_state) return(1.0)
   if (has_city || has_state || has_org) return(0.5)
   0.0
@@ -343,7 +418,7 @@ verify_record_score <- function(fau_vec, ad_vec,
                                 mode = c("default","fau_only")) {
   mode <- match.arg(mode)
   fau_score <- 0
-
+  
   if (length(fau_vec) > 0 && nzchar(last_norm %||% "")) {
     same_last <- startsWith(toupper(fau_vec), paste0(toupper(last_norm), ","))
     fau_same_last <- fau_vec[which(same_last)]
@@ -354,7 +429,7 @@ verify_record_score <- function(fau_vec, ad_vec,
         tgt <- toupper(target_first %||% "")
         mod <- toupper(modal_first  %||% "")
         initials <- substr(fnames, 1, 1)
-
+        
         sim_tgt <- 0
         if (nzchar(tgt)) {
           mask_tgt <- initials == substr(tgt, 1, 1)
@@ -363,7 +438,7 @@ verify_record_score <- function(fau_vec, ad_vec,
             if (!is.finite(sim_tgt)) sim_tgt <- 0
           }
         }
-
+        
         sim_mod <- 0
         if (nzchar(mod)) {
           mask_mod <- initials == substr(mod, 1, 1)
@@ -372,13 +447,13 @@ verify_record_score <- function(fau_vec, ad_vec,
             if (!is.finite(sim_mod)) sim_mod <- 0
           }
         }
-
+        
         fau_score <- max(sim_tgt, sim_mod, 0, na.rm = TRUE)
         if (!is.finite(fau_score)) fau_score <- 0
       }
     }
   }
-
+  
   aff <- .affil_score(ad_vec, city_token, state_token, org_token)
   total <- if (mode == "fau_only") fau_score else 0.60 * fau_score + 0.35 * aff + 0.05 * 0
   list(total = total, fau_score = fau_score, aff_score = aff)
@@ -547,15 +622,15 @@ run_decision_tree <- function(row) {
       au   <- rec$AU  %||% character(0)
       fau  <- rec$FAU %||% character(0)
       ad   <- rec$AD  %||% character(0)
-      
-      # Hard FAU gate only for AU-sourced queries (prevents Robert vs Rosalind)
+      # inside for (rec in recs) { ... }
       if (identical(source, "AU")) {
-        if (!.fau_gate_pass(fau, last_norm, first_tok, source = "AU", risk_last = risk)) {
+        if (!.fau_gate_pass(fau, last_norm, first_tok,
+                            source = "AU", risk_last = risk,
+                            ad_vec = ad, city_token = city, state_token = state, org_token = org)) {
           if (!is.na(pmid)) pmids_fail <- c(pmids_fail, pmid)
           next
         }
       }
-      
       sc <- verify_record_score(fau, ad, last_norm, first_tok, modal_first,
                                 city, state, org, mode = local_mode)
       
