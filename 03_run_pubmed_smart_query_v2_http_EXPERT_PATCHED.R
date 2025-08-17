@@ -168,7 +168,13 @@ parse_medline_records <- function(medline_txt) {
 }
 
 # ---------- EXPERT HELPER FUNCTIONS ----------
-
+# CHANGE S0 — NA-safe helpers (add near other small utils)
+safe_nzchar <- function(x) {
+  is.character(x) && length(x) == 1L && !is.na(x) && nzchar(x)
+}
+safe_any <- function(x) {
+  isTRUE(any(x, na.rm = TRUE))
+}
 # CHANGE A0 — add near top-level helpers
 .VERY_COMMON_LAST <- c(
   "SMITH","JOHNSON","WILLIAMS","BROWN","JONES","GARCIA","MILLER","DAVIS",
@@ -202,9 +208,10 @@ try({ library(stringi) }, silent = TRUE)
   if (requireNamespace("stringi", quietly = TRUE)) x <- stringi::stri_trans_general(x, "Latin-ASCII")
   gsub("[^A-Z0-9]+", " ", x)
 }
+# CHANGE C0.1 — return "" not NA; callers use safe_nzchar()
 .token_regex <- function(tok) {
   t <- .normalize_token(tok); t <- trimws(t)
-  if (!nzchar(t)) return(NA_character_)
+  if (!nzchar(t)) return("")                       # <-- was NA_character_
   if (nchar(t) == 2L && t %in% names(.STATE_MAP)) {
     full <- .STATE_MAP[[t]]
     return(paste0("\\b(", t, "|", gsub(" ", "\\\\s+", full), ")\\b"))
@@ -255,21 +262,24 @@ normalize_str <- function(x) {
   toks[1]
 }
 
-# CHANGE A1.5 — add this helper, used by FAU gate
+# CHANGE A1.5-fix — NA-safe best FAU match
 .best_fau_match <- function(fau_vec, last_norm, first_tok) {
   lastU <- toupper(last_norm %||% "")
   firstU <- toupper(first_tok %||% "")
-  if (!length(fau_vec) || !nzchar(lastU) || !nzchar(firstU)) return(list(matched=FALSE, sim=0))
+  if (!length(fau_vec) || !nzchar(lastU) || !nzchar(firstU)) {
+    return(list(matched = FALSE, sim = 0))
+  }
   cand <- fau_vec[startsWith(toupper(fau_vec), paste0(lastU, ","))]
-  if (!length(cand)) return(list(matched=FALSE, sim=0))
+  if (!length(cand)) return(list(matched = FALSE, sim = 0))
   fn <- vapply(cand, .fau_first_from, character(1), last_norm = lastU)
-  fn <- toupper(fn[!is.na(fn) & fn != ""])  # candidate first names
-  if (!length(fn)) return(list(matched=FALSE, sim=0))
-  # require same initial; then Jaro–Winkler similarity
-  same_init <- substr(fn,1,1) == substr(firstU,1,1)
-  if (!any(same_init)) return(list(matched=FALSE, sim=0))
-  sim <- max(stringdist::stringsim(firstU, fn[same_init], method = "jw", p = 0.1))
-  list(matched = TRUE, sim = sim)
+  fn <- toupper(fn[!is.na(fn) & fn != ""])
+  if (!length(fn)) return(list(matched = FALSE, sim = 0))
+
+  same_init <- substr(fn, 1, 1) == substr(firstU, 1, 1)
+  if (!safe_any(same_init)) return(list(matched = FALSE, sim = 0))
+
+  sim <- max(stringdist::stringsim(firstU, fn[same_init], method = "jw", p = 0.1), na.rm = TRUE)
+  list(matched = TRUE, sim = ifelse(is.finite(sim), sim, 0))
 }
 
 # CHANGE B — FAU gate with risk-aware thresholds
@@ -287,22 +297,25 @@ normalize_str <- function(x) {
 }
 
 
-# CHANGE C1 — replace your .affil_score with this version
+# CHANGE C1-fix — NA-safe affiliation scoring
 .affil_score <- function(ad_vec, city_token, state_token, org_token) {
   if (length(ad_vec) == 0) return(0)
   ads <- toupper(ad_vec)
-  if (requireNamespace("stringi", quietly = TRUE)) ads <- stringi::stri_trans_general(ads, "Latin-ASCII")
+  if (requireNamespace("stringi", quietly = TRUE)) {
+    ads <- stringi::stri_trans_general(ads, "Latin-ASCII")
+  }
   re_city  <- .token_regex(city_token)
   re_state <- .token_regex(state_token)
-  re_org   <- if (nzchar(org_token) && !is_generic_org(org_token)) .token_regex(org_token) else NA_character_
-  has_city  <- nzchar(re_city)  && any(grepl(re_city,  ads, perl = TRUE))
-  has_state <- nzchar(re_state) && any(grepl(re_state, ads, perl = TRUE))
-  has_org   <- nzchar(re_org)   && any(grepl(re_org,   ads, perl = TRUE))
+  re_org   <- if (nzchar(org_token) && !is_generic_org(org_token)) .token_regex(org_token) else ""
+
+  has_city  <- safe_nzchar(re_city)  && safe_any(grepl(re_city,  ads, perl = TRUE))
+  has_state <- safe_nzchar(re_state) && safe_any(grepl(re_state, ads, perl = TRUE))
+  has_org   <- safe_nzchar(re_org)   && safe_any(grepl(re_org,   ads, perl = TRUE))
+
   if (has_city && has_state) return(1.0)
   if (has_city || has_state || has_org) return(0.5)
   0.0
 }
-
 
 # EXPERT: Modal first name builder
 build_modal_fau_first <- function(all_fau, all_ad, last_norm, city_token, state_token, org_token) {
@@ -313,7 +326,7 @@ build_modal_fau_first <- function(all_fau, all_ad, last_norm, city_token, state_
   keep <- logical(length(all_fau))
   for (i in seq_along(all_fau)) {
     ad_i <- if (length(all_ad) >= i) all_ad[[i]] else all_ad
-    keep[i] <- .affil_score(ad_i, city_token, state_token, org_token) >= 0.5 &&
+    keep[i] <- isTRUE(.affil_score(ad_i, city_token, state_token, org_token) >= 0.5) &&
       startsWith(toupper(all_fau[i]), paste0(toupper(last_norm), ","))
   }
   f <- lapply(which(keep), function(i) .fau_first_from(all_fau[i], last_norm))
@@ -323,17 +336,17 @@ build_modal_fau_first <- function(all_fau, all_ad, last_norm, city_token, state_
   tab <- sort(table(f), decreasing = TRUE)
   names(tab)[1]
 }
-
-# CHANGE A2 — replace your verify_record_score with this one
+# CHANGE A2-fix — NA-safe similarity masks
 verify_record_score <- function(fau_vec, ad_vec,
                                 last_norm, target_first, modal_first,
                                 city_token, state_token, org_token,
                                 mode = c("default","fau_only")) {
   mode <- match.arg(mode)
   fau_score <- 0
+
   if (length(fau_vec) > 0 && nzchar(last_norm %||% "")) {
     same_last <- startsWith(toupper(fau_vec), paste0(toupper(last_norm), ","))
-    fau_same_last <- fau_vec[same_last]
+    fau_same_last <- fau_vec[which(same_last)]
     if (length(fau_same_last) > 0) {
       fnames <- vapply(fau_same_last, .fau_first_from, character(1), last_norm = last_norm)
       fnames <- toupper(fnames[!is.na(fnames) & fnames != ""])
@@ -341,26 +354,35 @@ verify_record_score <- function(fau_vec, ad_vec,
         tgt <- toupper(target_first %||% "")
         mod <- toupper(modal_first  %||% "")
         initials <- substr(fnames, 1, 1)
+
         sim_tgt <- 0
         if (nzchar(tgt)) {
           mask_tgt <- initials == substr(tgt, 1, 1)
-          if (any(mask_tgt)) sim_tgt <- max(stringdist::stringsim(tgt, fnames[mask_tgt], method = "jw", p = 0.1))
+          if (safe_any(mask_tgt)) {
+            sim_tgt <- max(stringdist::stringsim(tgt, fnames[mask_tgt], method = "jw", p = 0.1), na.rm = TRUE)
+            if (!is.finite(sim_tgt)) sim_tgt <- 0
+          }
         }
+
         sim_mod <- 0
         if (nzchar(mod)) {
           mask_mod <- initials == substr(mod, 1, 1)
-          if (any(mask_mod)) sim_mod <- max(stringdist::stringsim(mod, fnames[mask_mod], method = "jw", p = 0.1))
+          if (safe_any(mask_mod)) {
+            sim_mod <- max(stringdist::stringsim(mod, fnames[mask_mod], method = "jw", p = 0.1), na.rm = TRUE)
+            if (!is.finite(sim_mod)) sim_mod <- 0
+          }
         }
-        fau_score <- max(sim_tgt, sim_mod, 0)
+
+        fau_score <- max(sim_tgt, sim_mod, 0, na.rm = TRUE)
+        if (!is.finite(fau_score)) fau_score <- 0
       }
     }
   }
+
   aff <- .affil_score(ad_vec, city_token, state_token, org_token)
   total <- if (mode == "fau_only") fau_score else 0.60 * fau_score + 0.35 * aff + 0.05 * 0
   list(total = total, fau_score = fau_score, aff_score = aff)
 }
-
-
 # ---------- EXPERT AUTHOR MATCHING ----------
 build_allowed_author_set <- function(last_norm, first_tok, middle_tok) {
   last_norm  <- normalize_str(ifelse(is.na(last_norm),  "", last_norm))
