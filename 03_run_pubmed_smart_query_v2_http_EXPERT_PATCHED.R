@@ -415,10 +415,11 @@ build_modal_fau_first <- function(all_fau, all_ad, last_norm, city_token, state_
 verify_record_score <- function(fau_vec, ad_vec,
                                 last_norm, target_first, modal_first,
                                 city_token, state_token, org_token,
-                                mode = c("default","fau_only")) {
+                                mode = c("default", "fau_only")) {
   mode <- match.arg(mode)
+
+  # ---- compute FAU-only similarity ----
   fau_score <- 0
-  
   if (length(fau_vec) > 0 && nzchar(last_norm %||% "")) {
     same_last <- startsWith(toupper(fau_vec), paste0(toupper(last_norm), ","))
     fau_same_last <- fau_vec[which(same_last)]
@@ -429,7 +430,7 @@ verify_record_score <- function(fau_vec, ad_vec,
         tgt <- toupper(target_first %||% "")
         mod <- toupper(modal_first  %||% "")
         initials <- substr(fnames, 1, 1)
-        
+
         sim_tgt <- 0
         if (nzchar(tgt)) {
           mask_tgt <- initials == substr(tgt, 1, 1)
@@ -438,7 +439,7 @@ verify_record_score <- function(fau_vec, ad_vec,
             if (!is.finite(sim_tgt)) sim_tgt <- 0
           }
         }
-        
+
         sim_mod <- 0
         if (nzchar(mod)) {
           mask_mod <- initials == substr(mod, 1, 1)
@@ -447,16 +448,31 @@ verify_record_score <- function(fau_vec, ad_vec,
             if (!is.finite(sim_mod)) sim_mod <- 0
           }
         }
-        
+
         fau_score <- max(sim_tgt, sim_mod, 0, na.rm = TRUE)
         if (!is.finite(fau_score)) fau_score <- 0
       }
     }
   }
-  
+
+  # ---- affiliation evidence ----
   aff <- .affil_score(ad_vec, city_token, state_token, org_token)
-  total <- if (mode == "fau_only") fau_score else 0.60 * fau_score + 0.35 * aff + 0.05 * 0
-  list(total = total, fau_score = fau_score, aff_score = aff)
+
+  # ---- dynamic fusion + threshold ----
+  if (mode == "fau_only") {
+    total <- fau_score
+    thr   <- 0.78
+  } else {
+    if (aff >= 0.5) {
+      total <- 0.65 * fau_score + 0.35 * aff
+      thr   <- 0.72
+    } else {
+      total <- fau_score
+      thr   <- 0.80
+    }
+  }
+
+  list(total = total, fau_score = fau_score, aff_score = aff, threshold = thr)
 }
 # ---------- EXPERT AUTHOR MATCHING ----------
 build_allowed_author_set <- function(last_norm, first_tok, middle_tok) {
@@ -689,10 +705,15 @@ run_decision_tree <- function(row) {
   
   date_filter  <- .build_date_filter(row$EnumerationDate)
   affil_blk    <- rebuild_affil_block(city, state, org)
+  affil_blk_sanitized <- build_affil_block_sanitized(city, state, org)
   has_affil    <- nchar(affil_blk) > 0
   affil_tokens <- affil_tokens_from(city, state, org)
-  
+
   allowed_set  <- build_allowed_author_set(last_norm, first_tok, middle_tok)
+
+  # Aggregators to expose the bottleneck explicitly
+  affil_raw_max <- 0L;  affil_ver_max <- 0L
+  noaff_raw_max <- 0L;  noaff_ver_max <- 0L
   
   strict_fm <- row$name_strict_fm
   relaxed_f <- row$name_relaxed_f
@@ -700,9 +721,8 @@ run_decision_tree <- function(row) {
   # CHANGE D — do_query with source flag + FAU-only scoring for FAU/no-affil
   do_query <- function(name_term, use_affil, source = c("AU","FAU")) {
     source <- match.arg(source)
-    term <- if (use_affil && has_affil) paste(name_term, "AND", affil_blk) else name_term
+    term <- if (use_affil && has_affil) paste(name_term, "AND", affil_blk_sanitized) else name_term
     term <- gsub('"+','"', term, perl=TRUE)
-    # append per-row date filter already computed above as `date_filter`
     term <- paste(term, date_filter)
     log_line("ESearch term:", term)  # NOTE: log raw term (no shQuote), fixes double-quote output
     
@@ -716,13 +736,14 @@ run_decision_tree <- function(row) {
     term        <- s_back$term_used
     raw_n       <- s_back$count
     idlist      <- s_back$ids
-    field_used  <- s_back$field_used # Note: You might need to use this variable later
-    used_affil  <- isTRUE(s_back$used_affil) # Note: You might need to use this variable later
+    field_used  <- s_back$field_used
+    used_affil  <- isTRUE(s_back$used_affil)
     if (!length(idlist)) {
       return(list(term_used=term, raw_n=raw_n,
                   verified_total=0L, verified_first=0L, verified_last=0L,
                   pmids_verified=character(0), pmids_firstauthor=character(0),
-                  pmids_lastauthor=character(0), pmids_ambiguous=character(0)))
+                  pmids_lastauthor=character(0), pmids_ambiguous=character(0),
+                  used_affil = used_affil))
     }
     
     # EFETCH with lightweight retry (fix occasional HTTP 500)
@@ -744,7 +765,6 @@ run_decision_tree <- function(row) {
     modal_first <- build_modal_fau_first(all_fau, all_ad, last_norm, city, state, org)
     
     local_mode <- if (identical(source, "FAU") && !use_affil) "fau_only" else "default"
-    local_thr  <- if (local_mode == "fau_only") 0.80 else SCORE_THRESHOLD  # slightly more recall for FAU-only
     
     v_total <- v_first <- v_last <- 0L
     pmids_v <- pmids_fa <- pmids_la <- character(0)
@@ -772,8 +792,8 @@ run_decision_tree <- function(row) {
       }
       sc <- verify_record_score(fau, ad, last_norm, first_tok, modal_first,
                                 city, state, org, mode = local_mode)
-      
-      if (!is.na(pmid) && sc$total < local_thr) {
+
+      if (!is.na(pmid) && sc$total < sc$threshold) {
         pmids_fail <- c(pmids_fail, pmid)
         next
       }
@@ -794,7 +814,8 @@ run_decision_tree <- function(row) {
          pmids_verified=unique(na.omit(pmids_v)),
          pmids_firstauthor=unique(na.omit(pmids_fa)),
          pmids_lastauthor =unique(na.omit(pmids_la)),
-         pmids_ambiguous  =pmids_fail)
+         pmids_ambiguous  =pmids_fail,
+         used_affil = used_affil)
   }
   
   # CHANGE E — inside run_decision_tree(), replace the tier logic with:
@@ -818,10 +839,23 @@ run_decision_tree <- function(row) {
   fau_variants <- build_fau_variants(last_norm, first_tok, row$middle_name_token)
   for (fau_full in fau_variants) {
     res <- do_query(fau_full, use_affil = TRUE, source = "FAU")
+    if (!is.null(res$raw_n)) {
+      if (isTRUE(res$used_affil)) {
+        affil_raw_max <- max(affil_raw_max, res$raw_n %||% 0L)
+        affil_ver_max <- max(affil_ver_max, res$verified_total %||% 0L)
+      } else {
+        noaff_raw_max <- max(noaff_raw_max, res$raw_n %||% 0L)
+        noaff_ver_max <- max(noaff_ver_max, res$verified_total %||% 0L)
+      }
+    }
     if (res$verified_total > 0) {
-      return(c(list(match_tier = 1, ambiguous_reason = NA_character_), res))
+      return(c(list(
+        match_tier = 1, ambiguous_reason = NA_character_,
+        raw_n_with_affil = affil_raw_max, raw_n_without_affil = noaff_raw_max,
+        verified_with_affil_total = affil_ver_max,
+        verified_without_affil_total = noaff_ver_max
+      ), res))
     } else {
-      # record why it failed (raw>0 but verify==0 with affil ⇒ ZeroHits_AffilOnly)
       reasons <- c(reasons, classify_ambiguity(res$raw_n, res$verified_total, has_affil))
     }
   }
@@ -829,26 +863,67 @@ run_decision_tree <- function(row) {
   # 2) FAU-only (no affiliation) — uses FAU-only scoring mode (already handled inside do_query)
   for (fau_full in fau_variants) {
     res <- do_query(fau_full, use_affil = FALSE, source = "FAU")
+    if (!is.null(res$raw_n)) {
+      if (isTRUE(res$used_affil)) {
+        affil_raw_max <- max(affil_raw_max, res$raw_n %||% 0L)
+        affil_ver_max <- max(affil_ver_max, res$verified_total %||% 0L)
+      } else {
+        noaff_raw_max <- max(noaff_raw_max, res$raw_n %||% 0L)
+        noaff_ver_max <- max(noaff_ver_max, res$verified_total %||% 0L)
+      }
+    }
     if (res$verified_total > 0) {
-      return(c(list(match_tier = 2, ambiguous_reason = NA_character_), res))
+      return(c(list(
+        match_tier = 2, ambiguous_reason = NA_character_,
+        raw_n_with_affil = affil_raw_max, raw_n_without_affil = noaff_raw_max,
+        verified_with_affil_total = affil_ver_max,
+        verified_without_affil_total = noaff_ver_max
+      ), res))
     } else {
-      # no affiliation tokens applied here; if raw==0 → ZeroHits_NoAffil
       reasons <- c(reasons, classify_ambiguity(res$raw_n, res$verified_total, FALSE))
     }
   }
   
   # 3) AU + affiliation (strict FM), FAU-gated per-record
   res <- do_query(strict_fm, use_affil = TRUE, source = "AU")
+  if (!is.null(res$raw_n)) {
+    if (isTRUE(res$used_affil)) {
+      affil_raw_max <- max(affil_raw_max, res$raw_n %||% 0L)
+      affil_ver_max <- max(affil_ver_max, res$verified_total %||% 0L)
+    } else {
+      noaff_raw_max <- max(noaff_raw_max, res$raw_n %||% 0L)
+      noaff_ver_max <- max(noaff_ver_max, res$verified_total %||% 0L)
+    }
+  }
   if (res$verified_total > 0) {
-    return(c(list(match_tier = 3, ambiguous_reason = NA_character_), res))
+    return(c(list(
+      match_tier = 3, ambiguous_reason = NA_character_,
+      raw_n_with_affil = affil_raw_max, raw_n_without_affil = noaff_raw_max,
+      verified_with_affil_total = affil_ver_max,
+      verified_without_affil_total = noaff_ver_max
+    ), res))
   } else {
     reasons <- c(reasons, classify_ambiguity(res$raw_n, res$verified_total, has_affil))
   }
   
   # 3b) AU + affiliation (relaxed F), FAU-gated per-record
   res <- do_query(relaxed_f, use_affil = TRUE, source = "AU")
+  if (!is.null(res$raw_n)) {
+    if (isTRUE(res$used_affil)) {
+      affil_raw_max <- max(affil_raw_max, res$raw_n %||% 0L)
+      affil_ver_max <- max(affil_ver_max, res$verified_total %||% 0L)
+    } else {
+      noaff_raw_max <- max(noaff_raw_max, res$raw_n %||% 0L)
+      noaff_ver_max <- max(noaff_ver_max, res$verified_total %||% 0L)
+    }
+  }
   if (res$verified_total > 0) {
-    return(c(list(match_tier = 3, ambiguous_reason = NA_character_), res))
+    return(c(list(
+      match_tier = 3, ambiguous_reason = NA_character_,
+      raw_n_with_affil = affil_raw_max, raw_n_without_affil = noaff_raw_max,
+      verified_with_affil_total = affil_ver_max,
+      verified_without_affil_total = noaff_ver_max
+    ), res))
   } else {
     reasons <- c(reasons, classify_ambiguity(res$raw_n, res$verified_total, has_affil))
   }
@@ -856,33 +931,52 @@ run_decision_tree <- function(row) {
   # 4) AU strict (no affiliation) for STD risk only — tight cap
   if (identical(risk, "STD")) {
     res <- do_query(strict_fm, use_affil = FALSE, source = "AU")
+    if (!is.null(res$raw_n)) {
+      if (isTRUE(res$used_affil)) {
+        affil_raw_max <- max(affil_raw_max, res$raw_n %||% 0L)
+        affil_ver_max <- max(affil_ver_max, res$verified_total %||% 0L)
+      } else {
+        noaff_raw_max <- max(noaff_raw_max, res$raw_n %||% 0L)
+        noaff_ver_max <- max(noaff_ver_max, res$verified_total %||% 0L)
+      }
+    }
     if (res$verified_total > 0 && res$verified_total <= 5) {
-      return(c(list(match_tier = 4, ambiguous_reason = NA_character_), res))
+      return(c(list(
+        match_tier = 4, ambiguous_reason = NA_character_,
+        raw_n_with_affil = affil_raw_max, raw_n_without_affil = noaff_raw_max,
+        verified_with_affil_total = affil_ver_max,
+        verified_without_affil_total = noaff_ver_max
+      ), res))
     } else {
       reason <- if (res$verified_total == 0) {
-        # keep our new classification behavior here too
         classify_ambiguity(res$raw_n, res$verified_total, FALSE)
       } else {
         "TooManyHits_NoAffil"
       }
-      return(c(list(match_tier = 4, ambiguous_reason = reason), res))
+      return(c(list(
+        match_tier = 4, ambiguous_reason = reason,
+        raw_n_with_affil = affil_raw_max, raw_n_without_affil = noaff_raw_max,
+        verified_with_affil_total = affil_ver_max,
+        verified_without_affil_total = noaff_ver_max
+      ), res))
     }
   }
   
-  # No match across all tiers: choose the most informative reason we saw
-  # Prefer ZeroHits_AffilOnly if any tier with affiliation had raw hits but failed verification.
-  final_reason <- NA_character_
-  if (any(reasons == "ZeroHits_AffilOnly", na.rm = TRUE)) {
-    final_reason <- "ZeroHits_AffilOnly"
-  } else if (any(reasons == "ZeroHits_NoAffil", na.rm = TRUE)) {
-    final_reason <- "ZeroHits_NoAffil"
+  final_reason <- if (affil_raw_max > 0L && affil_ver_max == 0L) {
+    "ZeroHits_AffilOnly"
+  } else if (noaff_raw_max == 0L && affil_raw_max == 0L) {
+    "ZeroHits_NoAffil"
   } else {
-    final_reason <- "Ambiguous_NoAffil"
+    "Ambiguous_NoAffil"
   }
+
   list(match_tier = NA_integer_, term_used = NA_character_, raw_n = 0L,
        verified_total = 0L, verified_first = 0L, verified_last = 0L,
        pmids_verified = character(0), pmids_firstauthor = character(0), pmids_lastauthor = character(0),
-       ambiguous_reason = final_reason)
+       ambiguous_reason = final_reason,
+       raw_n_with_affil = affil_raw_max, raw_n_without_affil = noaff_raw_max,
+       verified_with_affil_total = affil_ver_max,
+       verified_without_affil_total = noaff_ver_max)
 }
 # ---------- EXPERT MAIN EXECUTION ----------
 run_phase2_http_expert <- function(in_csv = IN_CSV, out_csv = OUT_CSV) {
@@ -891,10 +985,14 @@ run_phase2_http_expert <- function(in_csv = IN_CSV, out_csv = OUT_CSV) {
   init_cols <- c("match_tier","query_used","raw_n_total","verified_n_total",
                  "verified_n_first","verified_n_last","ambiguous_reason",
                  "pmids_verified","pmids_firstauthor","pmids_lastauthor",
-                 "pmids_ambiguous")
+                 "pmids_ambiguous",
+                 "raw_n_with_affil","raw_n_without_affil",
+                 "verified_with_affil_total","verified_without_affil_total")
   for (col in init_cols) if (!col %in% names(dt)) dt[, (col) := NA_character_]
-  
-  num_cols <- c("match_tier","raw_n_total","verified_n_total","verified_n_first","verified_n_last")
+
+  num_cols <- c("match_tier","raw_n_total","verified_n_total","verified_n_first","verified_n_last",
+                "raw_n_with_affil","raw_n_without_affil",
+                "verified_with_affil_total","verified_without_affil_total")
   dt[, (intersect(num_cols, names(dt))) := lapply(.SD, as.integer), .SDcols = intersect(num_cols, names(dt))]
   
   row_idx <- if (RESUME) which(is.na(dt$verified_n_total)) else seq_len(nrow(dt))
@@ -931,7 +1029,11 @@ run_phase2_http_expert <- function(in_csv = IN_CSV, out_csv = OUT_CSV) {
         pmids_verified    = "",
         pmids_firstauthor = "",
         pmids_lastauthor  = "",
-        pmids_ambiguous   = ""
+        pmids_ambiguous   = "",
+        raw_n_with_affil             = as.integer(NA),
+        raw_n_without_affil          = as.integer(NA),
+        verified_with_affil_total    = as.integer(NA),
+        verified_without_affil_total = as.integer(NA)
       )]
     } else {
       pmids_v   <- paste(unique(ans$pmids_verified),    collapse = ";")
@@ -950,7 +1052,11 @@ run_phase2_http_expert <- function(in_csv = IN_CSV, out_csv = OUT_CSV) {
         pmids_verified    = pmids_v,
         pmids_firstauthor = pmids_fa,
         pmids_lastauthor  = pmids_la,
-        pmids_ambiguous   = pmids_amb
+        pmids_ambiguous   = pmids_amb,
+        raw_n_with_affil             = as.integer(ans$raw_n_with_affil %||% NA),
+        raw_n_without_affil          = as.integer(ans$raw_n_without_affil %||% NA),
+        verified_with_affil_total    = as.integer(ans$verified_with_affil_total %||% NA),
+        verified_without_affil_total = as.integer(ans$verified_without_affil_total %||% NA)
       )]
     }
     
