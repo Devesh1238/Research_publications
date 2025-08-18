@@ -546,7 +546,136 @@ affil_match_ok <- function(ad_vec, affil_tokens_upper) {
   end_y   <- DATE_CEILING_YEAR
   sprintf('AND ("%d/01/01"[Date - Publication] : "%d/12/31"[Date - Publication])', start_y, end_y)
 }
+# --------- F.1: Helpers (add once, below your ESearch/EFetch helpers) ---------
 
+# Safe-null infix, in case not defined elsewhere
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+
+# Basic logger passthrough (reuse yours if you already have one)
+log_line <- function(...) { cat(paste0("[pubmed] ", paste(..., collapse=" "), "\n")) }
+
+# Map of USPS -> full state names (minimal to fix OR/AND collisions; extend as needed)
+.STATE_MAP <- c(
+  "AL"="Alabama","AK"="Alaska","AZ"="Arizona","AR"="Arkansas","CA"="California",
+  "CO"="Colorado","CT"="Connecticut","DE"="Delaware","FL"="Florida","GA"="Georgia",
+  "HI"="Hawaii","ID"="Idaho","IL"="Illinois","IN"="Indiana","IA"="Iowa","KS"="Kansas",
+  "KY"="Kentucky","LA"="Louisiana","ME"="Maine","MD"="Maryland","MA"="Massachusetts",
+  "MI"="Michigan","MN"="Minnesota","MS"="Mississippi","MO"="Missouri","MT"="Montana",
+  "NE"="Nebraska","NV"="Nevada","NH"="New Hampshire","NJ"="New Jersey","NM"="New Mexico",
+  "NY"="New York","NC"="North Carolina","ND"="North Dakota","OH"="Ohio","OK"="Oklahoma",
+  "OR"="Oregon","PA"="Pennsylvania","RI"="Rhode Island","SC"="South Carolina",
+  "SD"="South Dakota","TN"="Tennessee","TX"="Texas","UT"="Utah","VT"="Vermont",
+  "VA"="Virginia","WA"="Washington","WV"="West Virginia","WI"="Wisconsin","WY"="Wyoming",
+  "DC"="District of Columbia"
+)
+
+.is_reserved_boolean <- function(x) {
+  t <- toupper(x %||% "")
+  t %in% c("OR","AND","NOT")
+}
+
+.state_full_or_self <- function(st) {
+  stU <- toupper(st %||% "")
+  if (nchar(stU) == 2L && stU %in% names(.STATE_MAP)) return(.STATE_MAP[[stU]])
+  st
+}
+
+# Treat obviously generic “org” tokens as non-useful in Affiliation literals (tune as needed)
+is_generic_org <- function(org_raw) {
+  if (is.null(org_raw) || !nzchar(org_raw)) return(TRUE)
+  o <- tolower(org_raw)
+  any(grepl("\\b(hospital|clinic|medical center|health|healthcare|university|college|dept|department)\\b", o))
+}
+
+# Build a sanitized affiliation filter (city OR full-state OR org), stripping boolean collisions
+build_affil_block_sanitized <- function(city_token, state_token, org_token) {
+  city <- toupper(city_token %||% "")
+  state_full <- toupper(.state_full_or_self(state_token) %||% "")
+  org_raw <- toupper(org_token %||% "")
+  org <- if (!is_generic_org(org_raw) && !.is_reserved_boolean(org_raw)) org_raw else ""
+  
+  parts <- character(0)
+  if (nzchar(city)       && !.is_reserved_boolean(city))       parts <- c(parts, sprintf('"%s"[Affiliation]', city))
+  if (nzchar(state_full) && !.is_reserved_boolean(state_full)) parts <- c(parts, sprintf('"%s"[Affiliation]', state_full))
+  if (nzchar(org)        && !.is_reserved_boolean(org))        parts <- c(parts, sprintf('"%s"[Affiliation]', org))
+  if (!length(parts)) return("")
+  paste0("(", paste(parts, collapse = " OR "), ")")
+}
+
+build_affil_variants <- function(city_token, state_token, org_token) {
+  state_full <- .state_full_or_self(state_token)
+  unique(c(
+    build_affil_block_sanitized(city_token, state_full, org_token), # city OR state_full OR org
+    build_affil_block_sanitized(city_token, state_full, ""),        # city OR state_full
+    build_affil_block_sanitized("",          state_full, ""),        # state_full only
+    build_affil_block_sanitized(city_token, "",         ""),         # city only
+    ""                                                               # no affiliation
+  ))
+}
+
+# Your existing constants used here (adjust names if yours differ)
+DATE_CEILING_YEAR <- getOption("pubmed.date_ceiling_year", 2025L)
+LOOKBACK_YEARS    <- getOption("pubmed.lookback_years",    35L)
+MAX_PMIDS_TO_FETCH<- getOption("pubmed.max_pmids",         300L)
+
+# If you already have this; otherwise define a simple “exact window” builder
+.build_date_filter <- function(enum_chr = NA_character_) {
+  # Keep your original behavior if you already had one; this simple version matches your CSV window
+  sprintf('AND ("%d/01/01"[Date - Publication] : "%d/12/31"[Date - Publication])',
+          DATE_CEILING_YEAR - LOOKBACK_YEARS, DATE_CEILING_YEAR)
+}
+
+.build_date_filter_from_year <- function(start_year, end_year = DATE_CEILING_YEAR) {
+  start_year <- max(1900L, as.integer(start_year %||% (DATE_CEILING_YEAR - LOOKBACK_YEARS)))
+  end_year   <- max(start_year, as.integer(end_year))
+  sprintf('AND ("%d/01/01"[Date - Publication] : "%d/12/31"[Date - Publication])', start_year, end_year)
+}
+
+date_backoff_ladder <- function(enum_chr) {
+  c(
+    .build_date_filter(enum_chr),
+    .build_date_filter_from_year(DATE_CEILING_YEAR - max(LOOKBACK_YEARS + 10L, 35L)),
+    .build_date_filter_from_year(DATE_CEILING_YEAR - 50L),
+    .build_date_filter_from_year(1950L),
+    .build_date_filter_from_year(1900L)
+  )
+}
+
+# ESearch backoff: try affil variants + date widening; final attempt flips AU<->FAU for recall
+esearch_pubmed_backoff <- function(name_term,
+                                   use_affil,
+                                   city_token, state_token, org_token,
+                                   date_filter, source_field,
+                                   retmax = MAX_PMIDS_TO_FETCH) {
+  
+  affil_opts <- if (isTRUE(use_affil)) build_affil_variants(city_token, state_token, org_token) else c("")
+  date_opts  <- unique(c(date_filter, date_backoff_ladder(NA_character_)))
+  
+  # attempt order: (affil variants) x (date ladder) with original field, then final field flip last
+  attempt_specs <- list()
+  for (aff in affil_opts) {
+    for (df in date_opts) {
+      attempt_specs[[length(attempt_specs)+1L]] <- list(aff = aff, df = df, fld = source_field)
+    }
+  }
+  flip_field <- if (identical(source_field, "FAU")) "AU" else "FAU"
+  attempt_specs[[length(attempt_specs)+1L]] <- list(aff = "", df = tail(date_opts, 1L), fld = flip_field)
+  
+  for (att in attempt_specs) {
+    term_try <- paste(
+      sub("\\[(AU|FAU)\\]$", paste0("[", att$fld, "]"), name_term, perl = TRUE),
+      if (nzchar(att$aff)) paste("AND", att$aff) else "",
+      att$df
+    )
+    term_try <- gsub('"+','"', term_try, perl=TRUE)  # normalize any doubled quotes
+    log_line("ESearch(backoff) →", term_try)
+    s <- esearch_pubmed(term_try, retmax = retmax)
+    if ((s$count %||% 0L) > 0L) {
+      return(list(ids = s$ids, count = s$count, term_used = term_try, field_used = att$fld, used_affil = nzchar(att$aff)))
+    }
+  }
+  list(ids = character(0), count = 0L, term_used = paste(name_term, date_filter), field_used = source_field, used_affil = FALSE)
+}
 # ==== [EXPERT DECISION TREE] Optimized multi-tier matching ====
 run_decision_tree <- function(row) {
   last_norm  <- toupper(ifelse(is.na(row$last_name_norm), "", row$last_name_norm))
@@ -577,8 +706,18 @@ run_decision_tree <- function(row) {
     term <- paste(term, date_filter)
     log_line("ESearch term:", term)  # NOTE: log raw term (no shQuote), fixes double-quote output
     
-    s <- esearch_pubmed(term, retmax = MAX_PMIDS_TO_FETCH)
-    raw_n  <- s$count; idlist <- s$ids
+    s_back <- esearch_pubmed_backoff(
+      name_term   = name_term,
+      use_affil   = (use_affil && has_affil),
+      city_token  = city, state_token = state, org_token = org,
+      date_filter = date_filter, source_field = source,
+      retmax      = MAX_PMIDS_TO_FETCH
+    )
+    term        <- s_back$term_used
+    raw_n       <- s_back$count
+    idlist      <- s_back$ids
+    field_used  <- s_back$field_used # Note: You might need to use this variable later
+    used_affil  <- isTRUE(s_back$used_affil) # Note: You might need to use this variable later
     if (!length(idlist)) {
       return(list(term_used=term, raw_n=raw_n,
                   verified_total=0L, verified_first=0L, verified_last=0L,
@@ -659,47 +798,92 @@ run_decision_tree <- function(row) {
   }
   
   # CHANGE E — inside run_decision_tree(), replace the tier logic with:
+  # --- PATCH F: helper for consistent ambiguity classification ---
+  classify_ambiguity <- function(raw_n, verified_n, has_affil_tokens) {
+    raw_n      <- raw_n %||% 0L
+    verified_n <- verified_n %||% 0L
+    if (raw_n == 0L) return("ZeroHits_NoAffil")
+    if (raw_n > 0L && verified_n == 0L) {
+      if (isTRUE(has_affil_tokens)) return("ZeroHits_AffilOnly")
+      return("ZeroHits_NoAffil")
+    }
+    return(NA_character_)
+  }
+  # CHANGE E — inside run_decision_tree(), replace the tier logic with:
+  
+  # We’ll collect reasons as we go; final fallback will pick the best label
+  reasons <- character(0)
   
   # 1) FAU-first, with affiliation
   fau_variants <- build_fau_variants(last_norm, first_tok, row$middle_name_token)
   for (fau_full in fau_variants) {
     res <- do_query(fau_full, use_affil = TRUE, source = "FAU")
-    if (res$verified_total > 0) return(c(list(match_tier = 1), res))
+    if (res$verified_total > 0) {
+      return(c(list(match_tier = 1, ambiguous_reason = NA_character_), res))
+    } else {
+      # record why it failed (raw>0 but verify==0 with affil ⇒ ZeroHits_AffilOnly)
+      reasons <- c(reasons, classify_ambiguity(res$raw_n, res$verified_total, has_affil))
+    }
   }
   
-  # 2) FAU-only (no affiliation) — uses FAU-only scoring mode
+  # 2) FAU-only (no affiliation) — uses FAU-only scoring mode (already handled inside do_query)
   for (fau_full in fau_variants) {
     res <- do_query(fau_full, use_affil = FALSE, source = "FAU")
-    if (res$verified_total > 0) return(c(list(match_tier = 2), res))
+    if (res$verified_total > 0) {
+      return(c(list(match_tier = 2, ambiguous_reason = NA_character_), res))
+    } else {
+      # no affiliation tokens applied here; if raw==0 → ZeroHits_NoAffil
+      reasons <- c(reasons, classify_ambiguity(res$raw_n, res$verified_total, FALSE))
+    }
   }
   
   # 3) AU + affiliation (strict FM), FAU-gated per-record
   res <- do_query(strict_fm, use_affil = TRUE, source = "AU")
-  if (res$verified_total > 0) return(c(list(match_tier = 3), res))
+  if (res$verified_total > 0) {
+    return(c(list(match_tier = 3, ambiguous_reason = NA_character_), res))
+  } else {
+    reasons <- c(reasons, classify_ambiguity(res$raw_n, res$verified_total, has_affil))
+  }
   
   # 3b) AU + affiliation (relaxed F), FAU-gated per-record
   res <- do_query(relaxed_f, use_affil = TRUE, source = "AU")
-  if (res$verified_total > 0) return(c(list(match_tier = 3), res))
+  if (res$verified_total > 0) {
+    return(c(list(match_tier = 3, ambiguous_reason = NA_character_), res))
+  } else {
+    reasons <- c(reasons, classify_ambiguity(res$raw_n, res$verified_total, has_affil))
+  }
   
   # 4) AU strict (no affiliation) for STD risk only — tight cap
   if (identical(risk, "STD")) {
     res <- do_query(strict_fm, use_affil = FALSE, source = "AU")
     if (res$verified_total > 0 && res$verified_total <= 5) {
-      return(c(list(match_tier = 4), res))
+      return(c(list(match_tier = 4, ambiguous_reason = NA_character_), res))
     } else {
-      reason <- if (res$verified_total == 0) "ZeroHits_NoAffil" else "TooManyHits_NoAffil"
+      reason <- if (res$verified_total == 0) {
+        # keep our new classification behavior here too
+        classify_ambiguity(res$raw_n, res$verified_total, FALSE)
+      } else {
+        "TooManyHits_NoAffil"
+      }
       return(c(list(match_tier = 4, ambiguous_reason = reason), res))
     }
   }
   
-  # No match
-  list(match_tier=NA_integer_, term_used=NA_character_, raw_n=0L,
-       verified_total=0L, verified_first=0L, verified_last=0L,
-       pmids_verified=character(0), pmids_firstauthor=character(0), pmids_lastauthor=character(0),
-       ambiguous_reason="Ambiguous_NoAffil")
+  # No match across all tiers: choose the most informative reason we saw
+  # Prefer ZeroHits_AffilOnly if any tier with affiliation had raw hits but failed verification.
+  final_reason <- NA_character_
+  if (any(reasons == "ZeroHits_AffilOnly", na.rm = TRUE)) {
+    final_reason <- "ZeroHits_AffilOnly"
+  } else if (any(reasons == "ZeroHits_NoAffil", na.rm = TRUE)) {
+    final_reason <- "ZeroHits_NoAffil"
+  } else {
+    final_reason <- "Ambiguous_NoAffil"
+  }
+  list(match_tier = NA_integer_, term_used = NA_character_, raw_n = 0L,
+       verified_total = 0L, verified_first = 0L, verified_last = 0L,
+       pmids_verified = character(0), pmids_firstauthor = character(0), pmids_lastauthor = character(0),
+       ambiguous_reason = final_reason)
 }
-
-
 # ---------- EXPERT MAIN EXECUTION ----------
 run_phase2_http_expert <- function(in_csv = IN_CSV, out_csv = OUT_CSV) {
   dt <- fread(in_csv)
