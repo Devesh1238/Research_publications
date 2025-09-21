@@ -48,24 +48,88 @@ if (!dir.exists("outputs")) dir.create("outputs", recursive = TRUE)
 if (!dir.exists(CACHE_DIR)) dir.create(CACHE_DIR, recursive = TRUE)
 
 # ---------- EXPERT LOGGING & DIAGNOSTICS ----------
+
+#' Log a Message to Console and File
+#'
+#' Appends a timestamped message to the console and to a log file.
+#'
+#' @param ... A series of character strings or objects that will be coerced to
+#'   character strings and concatenated to form the log message.
+#' @return Invisible NULL. The function is called for its side effect of logging.
 log_line <- function(...) {
   msg <- paste0(format(Sys.time(), "%F %T"), " | ", paste(..., collapse=" "))
   cat(msg, "\n")
   try(write(msg, file = LOG_FILE, append = TRUE), silent = TRUE)
 }
 
-# EXPERT: Enhanced diagnostics
+#' Log a Diagnostic Message
+#'
+#' A specialized logging function for recording diagnostic information related
+#' to a specific NPI and processing stage.
+#'
+#' @param npi The NPI (National Provider Identifier) of the surgeon.
+#' @param stage A character string describing the stage of the process (e.g., "RAW_HITS").
+#' @param details A character string providing specific details for the log entry.
+#' @return Invisible NULL. The function is called for its side effect of logging.
 log_diagnostic <- function(npi, stage, details) {
   log_line("DIAGNOSTIC [", npi, "] ", stage, ": ", details)
 }
 
+#' Sanitize a String for Use as a Filename
+#'
+#' Replaces characters that are not alphanumeric, dot, underscore, or hyphen
+#' with an underscore.
+#'
+#' @param x A character string to sanitize.
+#' @return A sanitized character string.
 .safe_name <- function(x) gsub("[^A-Za-z0-9._-]+", "_", x)
+
+#' Create a Cache Key
+#'
+#' Generates a unique, safe key for caching based on a prefix and a list of
+#' R objects. The objects are hashed using SHA-1.
+#'
+#' @param prefix A character string to prepend to the hash.
+#' @param ... Additional R objects to be included in the hash calculation.
+#' @return A character string representing the cache key.
 cache_key  <- function(prefix, ...) .safe_name(paste(prefix, digest(list(...), algo="sha1"), sep = "__"))
+
+#' Get the Full Path for a Cache Key
+#'
+#' Constructs the full file path for a given cache key.
+#'
+#' @param key A character string representing the cache key.
+#' @return A character string representing the full file path to the cache file.
 cache_path <- function(key) file.path(CACHE_DIR, paste0(key, ".rds"))
+
+#' Retrieve an Object from the Cache
+#'
+#' Reads and returns an R object from a cache file if it exists.
+#'
+#' @param key The cache key of the object to retrieve.
+#' @return The deserialized R object, or NULL if the cache file does not exist.
 cache_get  <- function(key) { p <- cache_path(key); if (file.exists(p)) readRDS(p) else NULL }
+
+#' Store an Object in the Cache
+#'
+#' Serializes and saves an R object to a file in the cache directory.
+#'
+#' @param key The cache key under which to store the object.
+#' @param val The R object to be cached.
+#' @return Invisible NULL. The function is called for its side effect of saving a file.
 cache_put  <- function(key, val) saveRDS(val, cache_path(key))
 
 # ---------- HTTP wrappers with enhanced resilience ----------
+
+#' Perform an HTTP GET Request and Parse JSON Response
+#'
+#' Sends an HTTP GET request, with built-in caching, retry logic, and error
+#' handling. It parses the response body as JSON.
+#'
+#' @param url The base URL for the request.
+#' @param query A named list of query parameters to be appended to the URL.
+#' @return The parsed JSON response as an R object (typically a list).
+#' @throws An error if the request fails after multiple retries.
 http_get_json <- function(url, query) {
   attempt <- 0
   query$tool  <- TOOL
@@ -89,6 +153,15 @@ http_get_json <- function(url, query) {
   }
 }
 
+#' Perform an HTTP GET Request and Return Text Response
+#'
+#' Sends an HTTP GET request with built-in caching, retry logic, and error
+#' handling. It returns the response body as a raw text string.
+#'
+#' @param url The base URL for the request.
+#' @param query A named list of query parameters to be appended to the URL.
+#' @return The response body as a single character string.
+#' @throws An error if the request fails after multiple retries.
 http_get_text <- function(url, query) {
   attempt <- 0
   query$tool  <- TOOL
@@ -113,6 +186,15 @@ http_get_text <- function(url, query) {
 }
 
 # ---------- ESearch / EFetch ----------
+
+#' Search PubMed using ESearch
+#'
+#' Performs a search on the PubMed database using the NCBI ESearch utility.
+#'
+#' @param term The search term (string) to be used in the query.
+#' @param retmax The maximum number of PMIDs to return.
+#' @return A list containing two elements: `ids` (a character vector of
+#'   PubMed IDs) and `count` (the total number of hits found).
 esearch_pubmed <- function(term, retmax = MAX_PMIDS_TO_FETCH) {
   out <- http_get_json(ESEARCH, list(db = "pubmed", term = term, retmode = "json", retmax = retmax))
   idlist <- out$esearchresult$idlist %||% character(0)
@@ -120,7 +202,15 @@ esearch_pubmed <- function(term, retmax = MAX_PMIDS_TO_FETCH) {
   list(ids = idlist, count = count)
 }
 
-# EXPERT: Enhanced EFetch with retry for 500s
+#' Fetch MEDLINE Records by PubMed IDs
+#'
+#' Retrieves full MEDLINE records for a given vector of PubMed IDs using the
+#' NCBI EFetch utility. It fetches records in chunks and includes a retry
+#' mechanism for robustness.
+#'
+#' @param id_vec A character vector of PubMed IDs.
+#' @return A single character string containing the MEDLINE records, separated
+#'   by double newlines. Returns an empty string if `id_vec` is empty.
 efetch_medline_by_ids <- function(id_vec) {
   if (length(id_vec) == 0) return("")
   ids <- unique(id_vec)
@@ -150,6 +240,17 @@ efetch_medline_by_ids <- function(id_vec) {
 }
 
 # ---------- MEDLINE parsing ----------
+
+#' Parse MEDLINE Text into a List of Records
+#'
+#' Splits a raw MEDLINE text block into individual records and then parses
+#' each record into a structured list containing key fields.
+#'
+#' @param medline_txt A single character string containing one or more MEDLINE
+#'   records, separated by double newlines.
+#' @return A list of lists, where each inner list represents a publication and
+#'   contains the fields `PMID`, `AU` (Authors), `FAU` (Full Authors), and
+#'   `AD` (Affiliation).
 parse_medline_records <- function(medline_txt) {
   if (is.null(medline_txt) || medline_txt == "") return(list())
   recs <- strsplit(medline_txt, "\n\n", fixed = TRUE)[[1]]
@@ -168,6 +269,15 @@ parse_medline_records <- function(medline_txt) {
 }
 
 # ---------- EXPERT HELPER FUNCTIONS ----------
+
+#' Normalize a String
+#'
+#' Converts a string to uppercase, replaces commas and periods with spaces,
+#' collapses multiple spaces, and trims whitespace from the ends. Handles NA
+#' inputs by converting them to empty strings.
+#'
+#' @param x A character string to normalize.
+#' @return A normalized character string.
 normalize_str <- function(x) {
   x <- ifelse(is.na(x), "", x)
   x <- toupper(x)
@@ -176,7 +286,16 @@ normalize_str <- function(x) {
   trimws(x)
 }
 
-# ==== [EXPERT PATCH A1] Vector/NA-safe FAU first name extraction ====
+#' Extract First Name from a FAU (Full Author) String
+#'
+#' Given a full author name string (typically in "LAST, First M" format) and
+#' the expected last name, this function extracts the first name token.
+#' It is designed to be safe for vector and NA inputs.
+#'
+#' @param fau_line A single string from a FAU field.
+#' @param last_norm The normalized last name to match against.
+#' @return The extracted first name as a character string, or `NA_character_`
+#'   if the pattern is not matched or inputs are invalid.
 .fau_first_from <- function(fau_line, last_norm) {
   if (is.null(fau_line) || length(fau_line) == 0) return(NA_character_)
   x <- toupper(fau_line[1])  # EXPERT: Force single element
@@ -196,7 +315,17 @@ normalize_str <- function(x) {
   toks[1]
 }
 
-# EXPERT: Affiliation scoring
+#' Score an Affiliation String
+#'
+#' Calculates a score from 0 to 1 based on the presence of city, state, or
+#' organization tokens within a vector of affiliation strings.
+#'
+#' @param ad_vec A character vector of affiliation strings for a single publication.
+#' @param city_token The city to search for.
+#' @param state_token The state to search for.
+#' @param org_token The organization to search for.
+#' @return A numeric score: 1.0 if both city and state match, 0.5 if one of
+#'   them matches or the organization matches, and 0.0 otherwise.
 .affil_score <- function(ad_vec, city_token, state_token, org_token) {
   if (length(ad_vec) == 0) return(0)
   ad_u <- toupper(ad_vec)
@@ -209,7 +338,21 @@ normalize_str <- function(x) {
   0.0
 }
 
-# EXPERT: Modal first name builder
+#' Build Modal First Name from FAU Records
+#'
+#' Analyzes a list of full author names (FAU) from multiple publications to
+#' determine the most common (modal) first name associated with a given last
+#' name, filtering by affiliation strength.
+#'
+#' @param all_fau A character vector of all FAU strings from the search results.
+#' @param all_ad A list of character vectors, where each element corresponds to
+#'   the affiliation strings for a publication.
+#' @param last_norm The normalized last name of the target author.
+#' @param city_token The target city.
+#' @param state_token The target state.
+#' @param org_token The target organization.
+#' @return The most frequent first name as a character string, or `NA_character_`
+#'   if no suitable first name can be determined.
 build_modal_fau_first <- function(all_fau, all_ad, last_norm, city_token, state_token, org_token) {
   if (length(all_fau) == 0) return(NA_character_)
   K <- min(60L, length(all_fau))
@@ -229,7 +372,22 @@ build_modal_fau_first <- function(all_fau, all_ad, last_norm, city_token, state_
   names(tab)[1]
 }
 
-# ==== [EXPERT PATCH A2] Vector-safe FAU similarity scoring ====
+#' Calculate Verification Score for a Publication Record
+#'
+#' Computes a composite score for a single publication to determine how likely
+#' it is to belong to the target author. The score is a weighted average of
+#' the name similarity score and the affiliation score.
+#'
+#' @param fau_vec A character vector of full author names from the publication.
+#' @param ad_vec A character vector of affiliation strings from the publication.
+#' @param last_norm The normalized last name of the target author.
+#' @param target_first The normalized first name of the target author.
+#' @param modal_first The modal first name derived from all search results.
+#' @param city_token The target city.
+#' @param state_token The target state.
+#' @param org_token The target organization.
+#' @return A list containing the `total` score, the `fau_score`, and the
+#'   `aff_score`.
 verify_record_score <- function(fau_vec, ad_vec,
                                 last_norm, target_first, modal_first,
                                 city_token, state_token, org_token) {
@@ -282,11 +440,31 @@ verify_record_score <- function(fau_vec, ad_vec,
 .VERY_COMMON_LAST <- c("WANG","KIM","LEE","SMITH","PATEL","KHAN","WU","BROWN","GARCIA","RODRIGUEZ",
                        "JOHNSON","WILLIAMS","JONES","MILLER","DAVIS","WILSON","MOORE","TAYLOR","ANDERSON","THOMAS")
 
+#' Calculate Jaro-Winkler String Similarity
+#'
+#' A wrapper around `stringdist::stringsim` to compute the Jaro-Winkler
+#' similarity between two strings. Returns 0 if either string is NA or empty.
+#'
+#' @param a The first character string.
+#' @param b The second character string.
+#' @return The Jaro-Winkler similarity score, a numeric value between 0 and 1.
 .jw <- function(a, b) {
   if (is.na(a) || is.na(b) || !nzchar(a) || !nzchar(b)) return(0)
   stringdist::stringsim(a, b, method = "jw", p = 0.1)
 }
 
+#' Find the Best FAU Match for a Target Name
+#'
+#' Searches through a vector of FAU strings to find the best match for a given
+#' last and first name. It constrains the search to entries with the same
+#' first initial.
+#'
+#' @param fau_vec A character vector of FAU strings.
+#' @param last_norm The normalized last name of the target author.
+#' @param target_first The normalized first name of the target author.
+#' @return A list containing `first` (the best matching first name found),
+#'   `sim` (the similarity score of the best match), and `matched` (a boolean
+#'   indicating if a plausible match was found).
 .best_fau_match <- function(fau_vec, last_norm, target_first) {
   if (length(fau_vec) == 0) return(list(first=NA_character_, sim=0, matched=FALSE))
   lastU  <- toupper(last_norm %||% "")
@@ -314,7 +492,20 @@ verify_record_score <- function(fau_vec, ad_vec,
   list(first = first_tokens[i], sim = sims[i], matched = TRUE)
 }
 
-# EXPERT: Optimized FAU Gate with context-aware thresholds
+#' Determine if a Publication Passes the "FAU Gate"
+#'
+#' This function acts as a pre-filter. It checks if any author in the FAU list
+#' of a publication is a plausible match for the target author. It uses
+#' graduated Jaro-Winkler similarity thresholds that depend on the query source,
+#' surname risk, and affiliation context.
+#'
+#' @param fau_vec A character vector of FAU strings from a publication.
+#' @param last_norm The normalized last name of the target author.
+#' @param first_tok The first name token of the target author.
+#' @param source The source of the query ("AU" or "FAU").
+#' @param risk_last The risk category of the surname ("STD" or "HIGH").
+#' @param tier_context The context of the query tier (e.g., "AU_WITH_AFFIL").
+#' @return A boolean value: `TRUE` if the publication passes the gate, `FALSE` otherwise.
 .fau_gate_pass <- function(fau_vec, last_norm, first_tok, source, risk_last, tier_context = "AU") {
   lastU  <- toupper(last_norm %||% "")
   firstU <- toupper(first_tok %||% "")
@@ -348,6 +539,17 @@ verify_record_score <- function(fau_vec, ad_vec,
 }
 
 # ---------- EXPERT AUTHOR MATCHING ----------
+
+#' Build a Set of Allowed Author Name Variants
+#'
+#' Generates a set of normalized author name variants based on the last name,
+#' first name token, and middle name token. This set is used for quick matching
+#' against author lists.
+#'
+#' @param last_norm The normalized last name.
+#' @param first_tok The first name token.
+#' @param middle_tok The middle name token.
+#' @return A character vector of unique, normalized author name variants.
 build_allowed_author_set <- function(last_norm, first_tok, middle_tok) {
   last_norm  <- normalize_str(ifelse(is.na(last_norm),  "", last_norm))
   first_tok  <- normalize_str(ifelse(is.na(first_tok),  "", first_tok))
@@ -364,6 +566,18 @@ build_allowed_author_set <- function(last_norm, first_tok, middle_tok) {
   allowed[nzchar(allowed)]
 }
 
+#' Check if an Author Match is OK
+#'
+#' Determines if any author in the AU or FAU lists of a publication matches
+#' the allowed set of name variants for the target author.
+#'
+#' @param au_vec Character vector of AU (author) strings.
+#' @param fau_vec Character vector of FAU (full author) strings.
+#' @param allowed_norm A character vector of allowed normalized name variants,
+#'   generated by `build_allowed_author_set`.
+#' @param last_norm Optional normalized last name for a starts-with check.
+#' @param first_tok Optional first name token for a starts-with check.
+#' @return `TRUE` if a match is found, `FALSE` otherwise.
 author_match_ok <- function(au_vec, fau_vec, allowed_norm, last_norm = NULL, first_tok = NULL) {
   au_norm  <- normalize_str(au_vec)
   fau_norm <- normalize_str(fau_vec)
@@ -375,6 +589,15 @@ author_match_ok <- function(au_vec, fau_vec, allowed_norm, last_norm = NULL, fir
   FALSE
 }
 
+#' Check for First and Last Author Hits
+#'
+#' Checks if the target author appears as the first or last author in a
+#' publication's author list.
+#'
+#' @param au_vec A character vector of AU (author) strings.
+#' @param allowed_norm A character vector of allowed normalized name variants.
+#' @return A named logical vector with elements `first` and `last`, indicating
+#'   if the target author was found in those positions.
 first_last_hits <- function(au_vec, allowed_norm) {
   au_norm <- normalize_str(au_vec)
   au_norm <- au_norm[au_norm != ""]
@@ -387,12 +610,30 @@ GENERIC_ORG_WORDS <- c("MEDICAL","GROUP","CENTER","CLINIC","GENERAL","HOSPITAL",
                        "HEALTH","PRACTICE","ASSOCIATES","PARTNERS","DEPT","DEPARTMENT",
                        "LLC","INC","PC","PLLC")
 
+#' Check if an Organization Name is Generic
+#'
+#' Determines if an organization name consists only of common, non-specific
+#' terms (e.g., "MEDICAL GROUP").
+#'
+#' @param org_chr The organization name as a character string.
+#' @return `TRUE` if the name is considered generic, `FALSE` otherwise.
 is_generic_org <- function(org_chr) {
   if (is.null(org_chr) || is.na(org_chr) || org_chr == "") return(TRUE)
   toks <- strsplit(org_chr, "\\s+")[[1]]
   all(toks %in% GENERIC_ORG_WORDS) && length(toks) <= 2
 }
 
+#' Rebuild an Affiliation Block for a PubMed Query
+#'
+#' Constructs a PubMed query string for affiliation based on city, state, and
+#' organization tokens. Generic organization names are excluded.
+#'
+#' @param city_token The city token.
+#' @param state_token The state token.
+#' @param org_token The organization token.
+#' @return A character string formatted for use in a PubMed query, e.g.,
+#'   `("STANFORD"[Affiliation] OR "CA"[Affiliation])`. Returns an empty string
+#'   if no valid tokens are provided.
 rebuild_affil_block <- function(city_token, state_token, org_token) {
   parts <- character(0)
   if (nzchar(city_token))  parts <- c(parts, sprintf('"%s"[Affiliation]', city_token))
@@ -402,12 +643,30 @@ rebuild_affil_block <- function(city_token, state_token, org_token) {
   paste0("(", paste(parts, collapse = " OR "), ")")
 }
 
+#' Create a Vector of Affiliation Tokens
+#'
+#' Consolidates city, state, and non-generic organization tokens into a single
+#' uppercase character vector for matching.
+#'
+#' @param city_token The city token.
+#' @param state_token The state token.
+#' @param org_token The organization token.
+#' @return A character vector of unique, non-empty, uppercase affiliation tokens.
 affil_tokens_from <- function(city_token, state_token, org_token) {
   toks <- unique(toupper(c(city_token, state_token,
                            if (nzchar(org_token) && !is_generic_org(org_token)) org_token else "")))
   toks[nzchar(toks)]
 }
 
+#' Check if an Affiliation Match is OK
+#'
+#' Determines if any of the provided affiliation strings from a publication
+#' contain any of the target affiliation tokens.
+#'
+#' @param ad_vec A character vector of affiliation strings from a publication.
+#' @param affil_tokens_upper A character vector of uppercase affiliation tokens
+#'   to search for.
+#' @return `TRUE` if a match is found, `FALSE` otherwise.
 affil_match_ok <- function(ad_vec, affil_tokens_upper) {
   if (length(affil_tokens_upper) == 0) return(FALSE)
   if (length(ad_vec) == 0) return(FALSE)
@@ -416,6 +675,14 @@ affil_match_ok <- function(ad_vec, affil_tokens_upper) {
 }
 
 # ---------- DATE HELPERS ----------
+
+#' Parse Year from an Enumeration Date String
+#'
+#' Extracts the four-digit year from a date string that could be in one of
+#' several common formats.
+#'
+#' @param enum_chr A character string representing a date.
+#' @return An integer representing the year, or `NA_integer_` if parsing fails.
 .parse_enum_year <- function(enum_chr) {
   if (is.null(enum_chr) || is.na(enum_chr) || !nzchar(enum_chr)) return(NA_integer_)
   for (fmt in c("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d")) {
@@ -429,6 +696,14 @@ affil_match_ok <- function(ad_vec, affil_tokens_upper) {
   NA_integer_
 }
 
+#' Build a Date Filter for a PubMed Query
+#'
+#' Creates a date range filter for a PubMed query. The range starts a specified
+#' number of years before the provider's enumeration date (or the current date
+#' if unavailable) and ends at the current date.
+#'
+#' @param enum_chr The enumeration date string for the provider.
+#' @return A character string formatted as a date filter for a PubMed query.
 .build_date_filter <- function(enum_chr) {
   ey <- .parse_enum_year(enum_chr)
   start_y <- if (is.na(ey)) DATE_CEILING_YEAR - LOOKBACK_YEARS else max(1900L, ey - LOOKBACK_YEARS)
@@ -436,7 +711,18 @@ affil_match_ok <- function(ad_vec, affil_tokens_upper) {
   sprintf('AND ("%d/01/01"[Date - Publication] : "%d/12/31"[Date - Publication])', start_y, end_y)
 }
 
-# ==== [EXPERT DECISION TREE] Optimized multi-tier matching ====
+#' Run the Multi-Tier Query Decision Tree for a Single Author
+#'
+#' This is the core logic function for a single author (row). It executes a
+#' series of queries with decreasing specificity (tiers) to find and verify
+#' publications. It starts with highly specific queries (e.g., full name plus
+#' affiliation) and falls back to broader queries if no results are found.
+#'
+#' @param row A data.table row (or list) containing the information for a single
+#'   author, including name tokens, affiliation tokens, and risk category.
+#' @return A list containing the results of the query, including the tier that
+#'   yielded a match, the query term used, publication counts, and lists of
+#'   PMIDs for verified, first-author, last-author, and ambiguous publications.
 run_decision_tree <- function(row) {
   last_norm  <- toupper(ifelse(is.na(row$last_name_norm), "", row$last_name_norm))
   first_tok  <- toupper(ifelse(is.na(row$first_name_token), "", row$first_name_token))
@@ -457,7 +743,7 @@ run_decision_tree <- function(row) {
   strict_fm <- row$name_strict_fm
   relaxed_f <- row$name_relaxed_f
   
-  # EXPERT: Enhanced query function with tier context
+  # This is a nested helper function, not exported.
   do_query <- function(name_term, use_affil, source = "AU", tier_context = "AU") {
     row_start <- proc.time()[["elapsed"]]
     term <- if (use_affil && has_affil) paste(name_term, "AND", affil_blk) else name_term
@@ -627,7 +913,19 @@ run_decision_tree <- function(row) {
   )
 }
 
-# ---------- EXPERT MAIN EXECUTION ----------
+#' Run the Main PubMed Query and Verification Pipeline
+#'
+#' This is the main execution function for the script. It reads an input CSV of
+#' authors, iterates through each one, and calls `run_decision_tree` to find
+#' and verify their publications. It handles resuming from a previous run, saves
+#' checkpoints, and writes the final, enriched data to an output CSV. It also
+#' logs summary statistics upon completion.
+#'
+#' @param in_csv The file path for the input CSV file. This file should contain
+#'   the authors to be queried.
+#' @param out_csv The file path for the output CSV file where the results will
+#'   be written.
+#' @return Invisibly returns the final `data.table` with all the results.
 run_phase2_http_expert <- function(in_csv = IN_CSV, out_csv = OUT_CSV) {
   dt <- fread(in_csv)
   
